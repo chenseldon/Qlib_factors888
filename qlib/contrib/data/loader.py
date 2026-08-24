@@ -1,4 +1,8 @@
-from qlib.data.dataset.loader import QlibDataLoader
+import pandas as pd
+
+from qlib.contrib.data.quantml_factors import QuantMLDataContext, compute_quantml_factors
+from qlib.data import D
+from qlib.data.dataset.loader import DataLoader, QlibDataLoader
 
 
 class Alpha360DL(QlibDataLoader):
@@ -56,6 +60,47 @@ class Alpha360DL(QlibDataLoader):
         names += ["VOLUME0"]
 
         return fields, names
+
+
+class QuantMLAdaptedDL(DataLoader):
+    """Load local-only QuantML adapted minute factors as daily features."""
+
+    def __init__(self, factors, context=None, use_cache=True, feature_group="feature"):
+        self.factors = factors
+        if context is None or isinstance(context, QuantMLDataContext):
+            self.context = context
+        elif isinstance(context, dict):
+            self.context = QuantMLDataContext(**context)
+        else:
+            raise TypeError("context must be QuantMLDataContext, dict, or None")
+        self.use_cache = use_cache
+        self.feature_group = feature_group
+
+    @staticmethod
+    def _resolve_instruments(instruments, start_time, end_time):
+        if instruments is None:
+            raise ValueError("QuantMLAdaptedDL requires explicit instruments or a Qlib market name")
+        if isinstance(instruments, str):
+            return D.list_instruments(
+                D.instruments(instruments),
+                start_time=start_time,
+                end_time=end_time,
+                as_list=True,
+            )
+        return list(instruments)
+
+    def load(self, instruments=None, start_time=None, end_time=None):
+        data = compute_quantml_factors(
+            factors=self.factors,
+            instruments=self._resolve_instruments(instruments, start_time, end_time),
+            start_time=start_time,
+            end_time=end_time,
+            context=self.context,
+            use_cache=self.use_cache,
+        )
+        if self.feature_group is not None:
+            data.columns = pd.MultiIndex.from_product([[self.feature_group], data.columns])
+        return data
 
 
 class Alpha158DL(QlibDataLoader):

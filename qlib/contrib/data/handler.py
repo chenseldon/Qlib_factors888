@@ -155,3 +155,40 @@ class Alpha158(DataHandlerLP):
 class Alpha158vwap(Alpha158):
     def get_label_config(self):
         return ["Ref($vwap, -2)/Ref($vwap, -1) - 1"], ["LABEL0"]
+
+
+class QuantMLAdapted(DataHandlerLP):
+    """Daily handler backed by the local QuantML adapted minute-factor core."""
+
+    def __init__(
+        self,
+        instruments,
+        factors,
+        start_time=None,
+        end_time=None,
+        context=None,
+        use_cache=True,
+        infer_processors=None,
+        learn_processors=None,
+        process_type=DataHandlerLP.PTYPE_A,
+        **kwargs,
+    ):
+        data_loader = {
+            "class": "QuantMLAdaptedDL",
+            "module_path": "qlib.contrib.data.loader",
+            "kwargs": {
+                "factors": factors,
+                "context": context,
+                "use_cache": use_cache,
+            },
+        }
+        super().__init__(
+            instruments=instruments,
+            start_time=start_time,
+            end_time=end_time,
+            data_loader=data_loader,
+            infer_processors=[] if infer_processors is None else infer_processors,
+            learn_processors=[] if learn_processors is None else learn_processors,
+            process_type=process_type,
+            **kwargs,
+        )
