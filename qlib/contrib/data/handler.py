@@ -168,6 +168,10 @@ class QuantMLAdapted(DataHandlerLP):
         end_time=None,
         context=None,
         use_cache=True,
+        label=None,
+        label_names=None,
+        materialized_uri=None,
+        enforce_market_membership=True,
         infer_processors=None,
         learn_processors=None,
         process_type=DataHandlerLP.PTYPE_A,
@@ -180,6 +184,10 @@ class QuantMLAdapted(DataHandlerLP):
                 "factors": factors,
                 "context": context,
                 "use_cache": use_cache,
+                "label": label,
+                "label_names": label_names,
+                "materialized_uri": materialized_uri,
+                "enforce_market_membership": enforce_market_membership,
             },
         }
         super().__init__(

@@ -51,7 +51,7 @@ from qlib.data.ops import (
 
 
 CATALOG_VERSION = "quantml-adapted-v1"
-OPERATOR_VERSION = "quantml-adapted-ops-v1"
+OPERATOR_VERSION = "quantml-adapted-ops-v2"
 AVAILABLE_FEATURES = frozenset({"open", "high", "low", "close", "volume", "total_turnover"})
 BLOCKED_FEATURES = frozenset({"num_trades", "s_dq_freeturnover"})
 RAW_COLUMNS = ("datetime", "code", "open", "close", "high", "low", "volume", "amount")
@@ -118,6 +118,8 @@ class QuantMLDataContext:
 
     minute_uri: Optional[Union[str, Path]] = None
     cache_uri: Optional[Union[str, Path]] = None
+    adjustment_uri: Optional[Union[str, Path]] = None
+    adjustment_mode: str = "none"
 
     def minute_path(self) -> Path:
         raw = self.minute_uri or os.environ.get("QLIB_QUANTML_MINUTE_URI")
@@ -133,6 +135,20 @@ class QuantMLDataContext:
         if raw is None:
             raw = Path.home() / ".cache" / "qlib" / "quantml_adapted"
         return Path(raw).expanduser().resolve()
+
+    def adjustment_path(self) -> Optional[Path]:
+        mode = self.adjustment_mode.lower()
+        if mode == "none":
+            return None
+        if mode != "hfq":
+            raise ValueError(f"unsupported QuantML adjustment mode: {self.adjustment_mode!r}")
+        raw = self.adjustment_uri or os.environ.get("QLIB_QUANTML_ADJUSTMENT_URI")
+        if raw is None:
+            raise ValueError("adjustment_uri or QLIB_QUANTML_ADJUSTMENT_URI is required for hfq mode")
+        path = Path(raw).expanduser().resolve()
+        if not path.is_dir():
+            raise FileNotFoundError(f"QuantML adjustment root does not exist: {path}")
+        return path
 
 
 def _session_times() -> Tuple[str, ...]:
@@ -511,6 +527,32 @@ def _display_instrument(instrument: str) -> str:
     return instrument.upper()
 
 
+def _adjustment_file(root: Path, instrument: str) -> Path:
+    exchange = "SH" if instrument.startswith("sh") else "SZ"
+    return root / f"{instrument[2:]}.{exchange}.csv"
+
+
+def _apply_hfq(frame: pd.DataFrame, instrument: str, root: Path) -> pd.DataFrame:
+    path = _adjustment_file(root, instrument)
+    if not path.is_file():
+        raise QuantMLDataQualityError(f"missing hfq adjustment file for {instrument}: {path}")
+    factors = pd.read_csv(path, usecols=["交易日期", "复权因子"], parse_dates=["交易日期"])
+    factors = factors.drop_duplicates("交易日期", keep="last").set_index("交易日期")["复权因子"]
+    dates = pd.DatetimeIndex(frame.index.normalize())
+    values = factors.reindex(dates).to_numpy(dtype=float)
+    valid = np.isfinite(values) & (values > 0)
+    if not valid.all():
+        missing_dates = sorted(set(dates[~valid].strftime("%Y-%m-%d")))
+        preview = ", ".join(missing_dates[:5])
+        raise QuantMLDataQualityError(
+            f"missing or non-positive hfq adjustment for {instrument}: {preview}"
+        )
+    adjusted = frame.copy()
+    for column in ("open", "high", "low", "close"):
+        adjusted[column] = adjusted[column].astype(float).to_numpy() * values
+    return adjusted
+
+
 def _read_partition(path: Path, instruments: Sequence[str]) -> pd.DataFrame:
     files = tuple(path.glob("*.parquet"))
     if not files:
@@ -549,6 +591,7 @@ def _load_minute_frames(
     root: Path,
     instruments: Sequence[str],
     load_dates: Sequence[pd.Timestamp],
+    adjustment_root: Optional[Path] = None,
 ) -> Dict[str, pd.DataFrame]:
     parts: Dict[str, list[pd.DataFrame]] = {instrument: [] for instrument in instruments}
     for date in load_dates:
@@ -560,10 +603,16 @@ def _load_minute_frames(
         for instrument, group in raw.groupby("code", sort=False):
             if instrument in parts:
                 parts[instrument].append(_normalize_session(group, instrument, date))
-    return {
+    result = {
         instrument: pd.concat(frames).sort_index() if frames else pd.DataFrame(columns=tuple(AVAILABLE_FEATURES))
         for instrument, frames in parts.items()
     }
+    if adjustment_root is not None:
+        result = {
+            instrument: _apply_hfq(frame, instrument, adjustment_root) if not frame.empty else frame
+            for instrument, frame in result.items()
+        }
+    return result
 
 
 def _source_signature(root: Path, dates: Sequence[pd.Timestamp]) -> dict:
@@ -613,6 +662,8 @@ def _cache_identity(
     start_time,
     end_time,
     signature: Mapping[str, int],
+    adjustment_mode: str = "none",
+    adjustment_signature: Optional[Mapping[str, object]] = None,
 ) -> Tuple[str, dict]:
     payload = {
         "catalog_version": CATALOG_VERSION,
@@ -625,6 +676,8 @@ def _cache_identity(
         "start_time": str(pd.Timestamp(start_time).date()),
         "end_time": str(pd.Timestamp(end_time).date()),
         "source_signature": dict(signature),
+        "adjustment_mode": adjustment_mode,
+        "adjustment_signature": dict(adjustment_signature or {}),
         "source_schema": list(RAW_COLUMNS),
         "field_mapping": {"volume": "volume*100", "total_turnover": "amount"},
         "session": "09:31-11:30,13:01-15:00",
@@ -632,6 +685,31 @@ def _cache_identity(
     }
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
     return digest, payload
+
+
+def _adjustment_signature(root: Optional[Path], instruments: Sequence[str]) -> dict:
+    if root is None:
+        return {}
+    count = 0
+    total_size = 0
+    latest_mtime_ns = 0
+    missing = []
+    for instrument in instruments:
+        path = _adjustment_file(root, instrument)
+        if not path.is_file():
+            missing.append(instrument)
+            continue
+        stat = path.stat()
+        count += 1
+        total_size += stat.st_size
+        latest_mtime_ns = max(latest_mtime_ns, stat.st_mtime_ns)
+    return {
+        "root": str(root),
+        "file_count": count,
+        "total_size": total_size,
+        "latest_mtime_ns": latest_mtime_ns,
+        "missing_instruments": missing,
+    }
 
 
 def _evaluate_instrument(
@@ -655,7 +733,7 @@ def _evaluate_instrument(
         daily = series.groupby(series.index.normalize()).last()
         values[factor.name] = daily.reindex(requested_dates)
     result = pd.DataFrame(values, index=pd.DatetimeIndex(requested_dates, name="datetime"))
-    return result[columns]
+    return result[columns].replace([np.inf, -np.inf], np.nan)
 
 
 def compute_quantml_factors(
@@ -674,10 +752,21 @@ def compute_quantml_factors(
     normalized = tuple(dict.fromkeys(_normalize_instrument(instrument) for instrument in instruments))
     context = context or QuantMLDataContext()
     root = context.minute_path()
+    adjustment_root = context.adjustment_path()
     warmup_sessions = max(1, math.ceil(_lookback_minutes(selected) / 240))
     load_dates, requested_dates = _select_dates(root, start_time, end_time, warmup_sessions)
     signature = _source_signature(root, load_dates)
-    cache_key, manifest = _cache_identity(root, selected, normalized, start_time, end_time, signature)
+    adjustment_signature = _adjustment_signature(adjustment_root, normalized)
+    cache_key, manifest = _cache_identity(
+        root,
+        selected,
+        normalized,
+        start_time,
+        end_time,
+        signature,
+        context.adjustment_mode.lower(),
+        adjustment_signature,
+    )
     cache_path = context.cache_path()
     data_path = cache_path / f"{cache_key}.parquet"
     manifest_path = cache_path / f"{cache_key}.json"
@@ -685,7 +774,7 @@ def compute_quantml_factors(
         cached = pd.read_parquet(data_path)
         return cached.sort_index()
 
-    frames = _load_minute_frames(root, normalized, load_dates)
+    frames = _load_minute_frames(root, normalized, load_dates, adjustment_root=adjustment_root)
     pieces = []
     for instrument in normalized:
         result = _evaluate_instrument(

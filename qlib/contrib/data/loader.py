@@ -1,6 +1,16 @@
-import pandas as pd
+import json
+from pathlib import Path
 
-from qlib.contrib.data.quantml_factors import QuantMLDataContext, compute_quantml_factors
+import pandas as pd
+import pyarrow.dataset as pyarrow_dataset
+
+from qlib.contrib.data.quantml_factors import (
+    OPERATOR_VERSION,
+    SOURCE_SHA256,
+    QuantMLDataContext,
+    compute_quantml_factors,
+    list_quantml_factors,
+)
 from qlib.data import D
 from qlib.data.dataset.loader import DataLoader, QlibDataLoader
 
@@ -65,7 +75,17 @@ class Alpha360DL(QlibDataLoader):
 class QuantMLAdaptedDL(DataLoader):
     """Load local-only QuantML adapted minute factors as daily features."""
 
-    def __init__(self, factors, context=None, use_cache=True, feature_group="feature"):
+    def __init__(
+        self,
+        factors,
+        context=None,
+        use_cache=True,
+        feature_group="feature",
+        label=None,
+        label_names=None,
+        materialized_uri=None,
+        enforce_market_membership=True,
+    ):
         self.factors = factors
         if context is None or isinstance(context, QuantMLDataContext):
             self.context = context
@@ -75,32 +95,135 @@ class QuantMLAdaptedDL(DataLoader):
             raise TypeError("context must be QuantMLDataContext, dict, or None")
         self.use_cache = use_cache
         self.feature_group = feature_group
+        self.label = [] if label is None else ([label] if isinstance(label, str) else list(label))
+        self.label_names = (
+            [f"LABEL{index}" for index in range(len(self.label))]
+            if label_names is None
+            else list(label_names)
+        )
+        if len(self.label) != len(self.label_names):
+            raise ValueError("label and label_names must have the same length")
+        self.materialized_uri = materialized_uri
+        self.enforce_market_membership = enforce_market_membership
 
     @staticmethod
     def _resolve_instruments(instruments, start_time, end_time):
         if instruments is None:
             raise ValueError("QuantMLAdaptedDL requires explicit instruments or a Qlib market name")
         if isinstance(instruments, str):
-            return D.list_instruments(
-                D.instruments(instruments),
+            config = D.instruments(instruments)
+            membership = D.list_instruments(
+                config,
                 start_time=start_time,
                 end_time=end_time,
-                as_list=True,
+                as_list=False,
             )
-        return list(instruments)
+            return list(membership), config, membership
+        values = list(instruments)
+        return values, values, None
+
+    @staticmethod
+    def _filter_membership(data, membership):
+        if membership is None or data.empty:
+            return data
+        pieces = []
+        available = set(data.index.get_level_values("instrument"))
+        for instrument, spans in membership.items():
+            if instrument not in available:
+                continue
+            current = data.xs(instrument, level="instrument", drop_level=False)
+            dates = current.index.get_level_values("datetime")
+            mask = pd.Series(False, index=current.index)
+            for start, end in spans:
+                mask |= (dates >= pd.Timestamp(start)) & (dates <= pd.Timestamp(end))
+            pieces.append(current.loc[mask.to_numpy()])
+        if not pieces:
+            return data.iloc[0:0]
+        return pd.concat(pieces).sort_index()
+
+    @staticmethod
+    def _membership_index(membership, start_time, end_time):
+        if membership is None:
+            return None
+        calendar = pd.DatetimeIndex(D.calendar(start_time=start_time, end_time=end_time, freq="day"))
+        pairs = []
+        for instrument, spans in membership.items():
+            for start, end in spans:
+                dates = calendar[(calendar >= pd.Timestamp(start)) & (calendar <= pd.Timestamp(end))]
+                pairs.extend((date, instrument) for date in dates)
+        return pd.MultiIndex.from_tuples(sorted(set(pairs)), names=["datetime", "instrument"])
+
+    def _load_materialized(self, instruments, start_time, end_time):
+        root = Path(self.materialized_uri).expanduser().resolve()
+        manifest_path = root / "_MANIFEST.json" if root.is_dir() else None
+        if manifest_path is not None:
+            if not manifest_path.is_file():
+                raise FileNotFoundError(f"materialized QuantML manifest is missing: {manifest_path}")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if manifest.get("catalog_sha256") != SOURCE_SHA256:
+                raise ValueError("materialized QuantML catalog SHA does not match the active catalog")
+            if manifest.get("operator_version") != OPERATOR_VERSION:
+                raise ValueError("materialized QuantML operator version does not match the active implementation")
+        paths = [root] if root.is_file() else sorted(root.glob("year=*/code=*/factors.parquet"))
+        if not paths:
+            raise FileNotFoundError(f"no QuantML materialized factors found: {root}")
+        requested = (
+            [factor.name for factor in list_quantml_factors(available=True)]
+            if self.factors == "all_supported"
+            else ([self.factors] if isinstance(self.factors, str) else list(self.factors))
+        )
+        dataset = pyarrow_dataset.dataset([str(path) for path in paths], format="parquet")
+        missing = set(["datetime", "instrument", *requested]) - set(dataset.schema.names)
+        if missing:
+            raise ValueError(f"materialized QuantML store is missing columns: {sorted(missing)}")
+        table = dataset.to_table(
+            columns=["datetime", "instrument", *requested],
+            filter=(pyarrow_dataset.field("datetime") >= pd.Timestamp(start_time))
+            & (pyarrow_dataset.field("datetime") <= pd.Timestamp(end_time)),
+        )
+        data = table.to_pandas(split_blocks=True, self_destruct=True)
+        data["datetime"] = pd.to_datetime(data["datetime"])
+        data["instrument"] = data["instrument"].str.upper()
+        data = data[data["instrument"].isin(instruments)]
+        if data.duplicated(["datetime", "instrument"]).any():
+            raise ValueError("materialized QuantML store contains duplicate datetime/instrument rows")
+        return data.set_index(["datetime", "instrument"])[requested].sort_index()
 
     def load(self, instruments=None, start_time=None, end_time=None):
-        data = compute_quantml_factors(
-            factors=self.factors,
-            instruments=self._resolve_instruments(instruments, start_time, end_time),
+        codes, qlib_instruments, membership = self._resolve_instruments(instruments, start_time, end_time)
+        if self.materialized_uri is None:
+            data = compute_quantml_factors(
+                factors=self.factors,
+                instruments=codes,
+                start_time=start_time,
+                end_time=end_time,
+                context=self.context,
+                use_cache=self.use_cache,
+            )
+        else:
+            data = self._load_materialized(codes, start_time, end_time)
+        if self.enforce_market_membership:
+            data = self._filter_membership(data, membership)
+            membership_index = self._membership_index(membership, start_time, end_time)
+            if membership_index is not None:
+                data = data.reindex(membership_index)
+        feature = data
+        if self.feature_group is not None:
+            feature.columns = pd.MultiIndex.from_product([[self.feature_group], feature.columns])
+        if not self.label:
+            return feature
+        labels = D.features(
+            qlib_instruments,
+            self.label,
             start_time=start_time,
             end_time=end_time,
-            context=self.context,
-            use_cache=self.use_cache,
+            freq="day",
         )
-        if self.feature_group is not None:
-            data.columns = pd.MultiIndex.from_product([[self.feature_group], data.columns])
-        return data
+        if labels.index.names == ["instrument", "datetime"]:
+            labels = labels.swaplevel().sort_index()
+        labels.index.names = ["datetime", "instrument"]
+        labels.columns = pd.MultiIndex.from_product([["label"], self.label_names])
+        return pd.concat([feature, labels.reindex(feature.index)], axis=1).sort_index()
 
 
 class Alpha158DL(QlibDataLoader):
