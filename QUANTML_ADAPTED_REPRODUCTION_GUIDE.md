@@ -209,14 +209,25 @@ Definitions:
 - `signic0 = mean(sign(ic_mean) * daily_IC > 0)`;
 - `signic004 = mean(sign(ic_mean) * daily_IC > 0.04)`;
 - descending-score quintiles `Group1` through `Group5`;
-- `long-short = Group1 - Group5`;
+- `long-short = (Group1 - Group5) / 2`, matching Qlib's default convention;
 - `long-average = Group1 - full-cross-section mean(label)`;
 - `t` is the one-sample t statistic of daily long-short returns.
 
-Do not use Qlib's `calc_long_short_return` unchanged: it returns
-`(long-short)/2`, which does not match this source table. Qlib `calc_ic` may be
-reused, but Qlib v0.9.7 has no single built-in report that emits all required
-fields.
+The first value returned by Qlib's `calc_long_short_return` uses the required
+`/2` convention. Its second value is the full-cross-section average label, not
+the required `Group1 - average(label)`, so the complete table still needs the
+standard evaluator in `qlib.contrib.eva.factor`.
+
+The evaluator exposes:
+
+```python
+from qlib.contrib.eva.factor import (
+    FACTOR_METRIC_COLUMNS,
+    evaluate_factor,
+    evaluate_factors,
+    render_factor_metrics_markdown,
+)
+```
 
 Write two outputs:
 
